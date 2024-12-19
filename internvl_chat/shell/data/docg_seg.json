@@ -1,0 +1,30 @@
+{
+  "color_block_content_qa": {
+    "root": "/",
+    "annotation": "/cpfs01/user/caixinyu/markdownGenerate/test_bbox/color_block_content_qa.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 84060
+  },
+  "title_content_qa": {
+    "root": "/",
+    "annotation": "/cpfs01/user/caixinyu/markdownGenerate/test_bbox/title_content_qa.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 31144
+  },
+  "start_block_content_qa": {
+    "root": "/",
+    "annotation": "/cpfs01/user/caixinyu/markdownGenerate/test_bbox/start_block_content_qa.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 66894
+  },
+  "basic_block_content_qa": {
+    "root": "/",
+    "annotation": "/cpfs01/user/caixinyu/markdownGenerate/test_bbox/basic_block_content_qa.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 67717
+  }
+}

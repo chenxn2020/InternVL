@@ -68,7 +68,10 @@ from internvl.patch import (
     replace_train_dataloader,
     replace_train_sampler,
 )
-
+from internvl.model.internvl_seg import (
+    SegInternVLForCausalLM,
+    init_vision_seg_for_model,
+)
 from internvl.model.segment_anything import ResizeLongestSide
 from internvl.train.constants import (
     BOX_END_TOKEN,
@@ -194,6 +197,43 @@ class ModelArguments:
         default=False,
         metadata={'help': 'Set to True to use the liger kernel.'}
     )
+    #-----seg model params
+    train_mask_decoder : bool = field(
+        default=True,
+        metadata={'help': 'Set to True to train mask decoder.'}
+    )
+    use_mm_start_end : bool = field(
+        default=True,
+        metadata={'help': 'Set to True to use mm_start_end tokens.'}
+    )
+    out_dim: int = field(
+        default=256,
+        metadata={'help': 'Specify the number of ViT layers to unfreeze. Default is 0.'},
+    )
+    ce_loss_weight: float = field(
+        default=1.0,
+        metadata={'help': 'Specify the number of ViT layers to unfreeze. Default is 0.'},
+    )
+    dice_loss_weight: float= field(
+        default=0.5,
+        metadata={'help': 'Specify the number of ViT layers to unfreeze. Default is 0.'},
+    )
+    bce_loss_weight: float = field(
+        default=2.0,
+        metadata={'help': 'Specify the number of ViT layers to unfreeze. Default is 0.'},
+    )
+    segmentation_model_path: Optional[str] = field(
+        default=None,
+        metadata={'help': 'Specify the number of ViT layers to unfreeze. Default is 0.'},
+    )
+    lora_r: float = field(
+        default=-1,
+        metadata={'help': 'Specify the number of ViT layers to unfreeze. Default is 0.'},
+    )
+
+
+
+
 
 
 @dataclass
@@ -309,6 +349,10 @@ class DataTrainingArguments:
         default=1024,
         metadata={'help': 'Image size of segmentation model.'},
     )
+    inference: bool = field(
+        default=False,
+        metadata={'help': 'Whether to train internvl to segmentation.'},
+    )
 
 
 class LazySupervisedDataset(Dataset):
@@ -343,6 +387,7 @@ class LazySupervisedDataset(Dataset):
         force_shuffle=False,
         random_seed=0,
         do_seg = False,
+        inference = False,
         sam_size = 1024,
     ):
         super(LazySupervisedDataset, self).__init__()
@@ -370,6 +415,7 @@ class LazySupervisedDataset(Dataset):
             self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
             self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
             self.ignore_label = 255
+            self.inference = inference
         #--判断是否做seg
 
         # hyperparameters for distributed training
@@ -617,9 +663,8 @@ class LazySupervisedDataset(Dataset):
         conversations = [data_item['conversations']]
         masks = get_mask_from_data(data_item, image)
         masks = torch.from_numpy(masks).unsqueeze(0)
-        label_sam = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
+        labels_sam = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
         # Create the final return dictionary
-        print('****************************SEG DATASET***************************************')
         ret = dict(
             #--VLM 训练使用
             input_ids=ret['input_ids'][0],
@@ -629,12 +674,13 @@ class LazySupervisedDataset(Dataset):
             pixel_values=pixel_values,
             image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
             #--SAM 分割使用
-            image_sam = image_sam, 
+            images = image_sam, 
             conversations = conversations,
-            resize = resize_sam,
-            do_seg = self.do_seg,
-            masks = masks,
-            label_sam = label_sam,
+            resize_list = resize_sam,
+            do_segs = self.do_seg,
+            masks_list = masks,
+            label_list = labels_sam,
+            inference = self.inference,
         )
         return ret
     def multi_modal_multi_image_get_seg_item(self, data_item):
@@ -927,6 +973,7 @@ def build_datasets(
             force_shuffle=data_args.use_packed_ds,
             random_seed=ds_idx,
             do_seg = data_args.do_seg,
+            inference= data_args.inference,
             sam_size = data_args.sam_size,
         )
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
@@ -1050,11 +1097,13 @@ def main():
     tokenizer.model_max_length = data_args.max_seq_length
     token_list = [IMG_START_TOKEN, IMG_END_TOKEN, IMG_CONTEXT_TOKEN,
                   QUAD_START_TOKEN, QUAD_END_TOKEN, REF_START_TOKEN,
-                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, SEG_TOKEN]
+                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN]
     num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
+    num_new_tokens = tokenizer.add_tokens(SEG_TOKEN)
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None # 默认为None
-
+    #--add <SEG> token idx
+    model_args.seg_token_idx = tokenizer(SEG_TOKEN, add_special_tokens=False).input_ids[0] 
     #---skip
     if data_args.use_packed_ds:
         replace_internlm2_attention_class()
@@ -1074,6 +1123,18 @@ def main():
         # apply_liger_kernel_to_internvit()
     #---skip-----------
 
+    # Prepare model creation arguments
+    seg_model_args = {
+        "train_mask_decoder": model_args.train_mask_decoder,
+        "out_dim": model_args.out_dim,
+        "ce_loss_weight": model_args.ce_loss_weight,
+        "dice_loss_weight": model_args.dice_loss_weight,
+        "bce_loss_weight": model_args.bce_loss_weight,
+        "seg_token_idx": model_args.seg_token_idx,
+        "segmentation_model_path": model_args.segmentation_model_path,
+        "use_mm_start_end": model_args.use_mm_start_end,
+        "tokenizer": tokenizer,
+    }
     #Initialize the model
     #TODO: 仿照GSVA写一个外部模型接口
     if model_args.model_name_or_path is not None:
@@ -1093,8 +1154,8 @@ def main():
         config.ps_version = model_args.ps_version
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
-        model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+        model = SegInternVLForCausalLM.from_pretrained(
+            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, **seg_model_args)
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -1151,10 +1212,11 @@ def main():
     model.num_image_token = int((data_args.force_image_size // patch_size) ** 2 * (data_args.down_sample_ratio ** 2))
 
     if num_new_tokens > 0:
+        logger.info(f'Add new Token and resize vocab_size!!!')
         model.language_model.resize_token_embeddings(len(tokenizer))
         output_embeddings = model.language_model.get_output_embeddings().weight.data
         output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings[-num_new_tokens:] = output_embeddings_avg
+        output_embeddings[-num_new_tokens:] = output_embeddings_avg #给新加token一个平均初始化
 
         model.config.llm_config.vocab_size = len(tokenizer)
         model.language_model.config.vocab_size = len(tokenizer)
@@ -1165,6 +1227,9 @@ def main():
     if model_args.grad_checkpoint:
         model.language_model._set_gradient_checkpointing()
 
+    #---设置seg model的参数训练配置
+    model = init_vision_seg_for_model(model, tokenizer, model_args)
+    #----
     train_dataset = build_datasets(
         data_args, tokenizer, tcs_loader, model, group_by_length=training_args.group_by_length,
         dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
@@ -1172,48 +1237,6 @@ def main():
         normalize_type=data_args.normalize_type, min_num_frame=data_args.min_num_frame,
         max_num_frame=data_args.max_num_frame)
     
-    #TODO:code dataset
-    # a = train_dataset[0]
-    # from torch.utils.data import DataLoader
-    # print('Debug collator**************************')
-    # dataloader = DataLoader(train_dataset
-    #                         , batch_size=2, shuffle=True, 
-    #                         collate_fn=concat_pad_data_collator)
-    #--直接包装是没问题的
-    # for batch in dataloader:
-    #     from IPython import embed; embed(); exit()
-    #--------
-    def _freeze_params(module):
-        for param in module.parameters():
-            param.requires_grad = False
-
-    if model_args.freeze_backbone:
-        # model.vision_model = model.vision_model.eval()
-        _freeze_params(model.vision_model)
-
-    if model_args.freeze_llm:
-        model.language_model = model.language_model.eval()
-        _freeze_params(model.language_model)
-
-    if model_args.unfreeze_lm_head:
-        model.language_model.lm_head.requires_grad = True
-
-    if model_args.use_backbone_lora:
-        model.wrap_backbone_lora(r=model_args.use_backbone_lora, lora_alpha=2 * model_args.use_backbone_lora)
-        model.config.use_backbone_lora = model_args.use_backbone_lora
-
-    if model_args.use_llm_lora:
-        model.wrap_llm_lora(r=model_args.use_llm_lora, lora_alpha=2 * model_args.use_llm_lora)
-        model.config.use_llm_lora = model_args.use_llm_lora
-
-    if model_args.freeze_mlp:
-        _freeze_params(model.mlp1)
-
-    if model_args.unfreeze_vit_layers != 0:
-        layers = model.vision_model.encoder.layers[model_args.unfreeze_vit_layers:]
-        for k, v in layers.named_parameters():
-            logger.info(f'Unfreezing ViT layer: {k}')
-            v.requires_grad = True
 
     # print trainable parameters
     if dist.get_rank() == 0:
@@ -1235,7 +1258,7 @@ def main():
         )
     else:
         if data_args.do_seg:
-            collator = concat_seg_data_collator
+            collator = partial(concat_seg_data_collator, tokenizer=tokenizer)
         else:
             collator = concat_pad_data_collator
 

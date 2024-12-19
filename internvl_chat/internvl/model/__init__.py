@@ -9,6 +9,8 @@ import math
 import torch
 from internvl.model.internvl_chat import InternVLChatConfig, InternVLChatModel
 from transformers import AutoTokenizer
+from .internvl_seg.modeling_seg_internvl import SegInternVLForCausalLM
+from .internvl_seg.prepare_model_tokenizer import init_vision_seg_for_model
 
 
 def split_model(num_layers, vit_alpha=0.5):
