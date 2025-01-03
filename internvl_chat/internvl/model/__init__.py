@@ -9,8 +9,14 @@ import math
 import torch
 from internvl.model.internvl_chat import InternVLChatConfig, InternVLChatModel
 from transformers import AutoTokenizer
-from .internvl_seg.modeling_seg_internvl import SegInternVLForCausalLM
-from .internvl_seg.prepare_model_tokenizer import init_vision_seg_for_model
+from internvl.model.internvl_seg import (
+    SegInternVLForCausalLM,
+    init_vision_seg_for_model,
+    InternVLMagnifier,
+)
+from internvl.train.constants import SEG_TOKEN, IMG_CONTEXT_TOKEN
+from safetensors.torch import load_file
+import os
 
 
 def split_model(num_layers, vit_alpha=0.5):
@@ -49,4 +55,46 @@ def load_model_and_tokenizer(args):
         load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit, **kwargs).eval()
     if not args.load_in_8bit and not args.load_in_4bit and not args.auto:
         model = model.cuda()
+    return model, tokenizer
+
+def load_seg_model_and_tokenizer(args):
+    checkpoint = args.checkpoint
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True, use_fast=False)
+    config = InternVLChatConfig.from_pretrained(checkpoint)
+    seg_model_args = {
+        "seg_token_idx": tokenizer(SEG_TOKEN, add_special_tokens=False).input_ids[0],
+        "segmentation_model_path": args.segmentation_model_path,
+        "tokenizer": tokenizer,
+    }
+    #--from_pretrained 已经正确加载模型权重了。保险起见再用safetensor加载一遍
+    model = SegInternVLForCausalLM.from_pretrained(
+        checkpoint, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16,config=config, **seg_model_args)
+    # 加载权重到模型
+    file_path = os.path.join(checkpoint, 'model.safetensors')
+    state_dict = load_file(file_path)
+    model.load_state_dict(state_dict, strict=False)
+    if not args.load_in_8bit and not args.load_in_4bit and not args.auto:
+        model = model.cuda()
+    model.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+    return model, tokenizer
+def load_mag_model_and_tokenizer(model_args):
+    checkpoint = model_args.checkpoint
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True, use_fast=False)
+    config = InternVLChatConfig.from_pretrained(checkpoint)
+    #--from_pretrained 已经正确加载模型权重了。保险起见再用safetensor加载一遍
+    model = InternVLMagnifier.from_pretrained(
+            checkpoint, torch_dtype=torch.bfloat16, config=config, 
+            llm_tokenizer=tokenizer, args=model_args)
+    #加载权重到模型
+    if not hasattr(config, "seg_model"):
+        model.init_seg_mformer()
+    # 遍历分片文件并加载权重
+    state_dict = {}
+    for i in range(1, 6):  # 根据分片文件数量动态调整
+        shard_path = f"{model_args.checkpoint}/model-0000{i}-of-00005.safetensors"
+        shard_state_dict = load_file(shard_path)
+        state_dict.update(shard_state_dict)
+    model.load_state_dict(state_dict, strict=False)
+    model = model.to(dtype=torch.bfloat16).cuda()
+    model.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     return model, tokenizer

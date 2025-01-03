@@ -1,17 +1,19 @@
 set -x
 
-GPUS=${GPUS:-2}
+GPUS=${GPUS:-4}
 BATCH_SIZE=${BATCH_SIZE:-128}
 PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-8}
 GRADIENT_ACC=$((BATCH_SIZE / PER_DEVICE_BATCH_SIZE / GPUS))
+NUM_WORKERS=12
 
 
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-export MASTER_PORT=34220
+export MASTER_PORT=32120
 export TF_CPP_MIN_LOG_LEVEL=3
 export LAUNCHER=pytorch
+export SETUPTOOLS_USE_DISTUTILS=local
 
-OUTPUT_DIR='work_dirs/internvl_chat_v2_0/InternVL2_5-1B_seg'
+OUTPUT_DIR='work_dirs/InternVL2_5-1B_seg_8w_color_sam'
 
 if [ ! -d "$OUTPUT_DIR" ]; then
   mkdir -p "$OUTPUT_DIR"
@@ -22,7 +24,8 @@ fi
 # gradient accumulation steps: 4
 # total batch size: 128 
 # epoch: 1
-torchrun \
+# CUDA_VISIBLE_DEVICES=7 torchrun \
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
   --nnodes=1 \
   --node_rank=0 \
   --master_addr=127.0.0.1 \
@@ -32,7 +35,7 @@ torchrun \
   --model_name_or_path "/cpfs01/user/caixinyu/lisiqi/InternVL/internvl_chat/pretrained/InternVL2_5-1B" \
   --conv_style "internvl2_5_seg" \
   --output_dir ${OUTPUT_DIR} \
-  --meta_path "/cpfs01/user/chenxiangnan/InternVL_SEG/internvl_chat/shell/data/docg_seg.json" \
+  --meta_path "/cpfs01/user/caixinyu/chenxiangnan/dsw/InternVL_SEG/internvl_chat/shell/data/color_train.json" \
   --overwrite_output_dir True \
   --force_image_size 448 \
   --max_dynamic_patch 12 \
@@ -42,7 +45,7 @@ torchrun \
   --freeze_mlp False \
   --freeze_backbone False \
   --vision_select_layer -1 \
-  --dataloader_num_workers 0 \
+  --dataloader_num_workers $NUM_WORKERS \
   --bf16 True \
   --num_train_epochs 12 \
   --per_device_train_batch_size ${PER_DEVICE_BATCH_SIZE} \
@@ -51,7 +54,7 @@ torchrun \
   --save_strategy "steps" \
   --save_steps 500 \
   --save_total_limit 2 \
-  --learning_rate 4e-5 \
+  --learning_rate 4.5e-5 \
   --weight_decay 0.01 \
   --warmup_ratio 0.03 \
   --lr_scheduler_type "cosine" \

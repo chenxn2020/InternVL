@@ -102,13 +102,13 @@ from internvl.train.dataset import (
 from internvl.train.dataset_packed import PackedDataset, packed_collate_fn
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
-try:
-    from petrel_client.client import Client
-    from petrel_client.common.config import Config
-    has_tcs_loader = True
-except ImportError as E:
-    print('petrel_client is not installed. Using PIL to load images.')
-    has_tcs_loader = False
+# try:
+#     from petrel_client.client import Client
+#     from petrel_client.common.config import Config
+#     has_tcs_loader = True
+# except ImportError as E:
+#     print('petrel_client is not installed. Using PIL to load images.')
+has_tcs_loader = False
 
 # Set constants for image processing and logging
 IGNORE_INDEX = -100
@@ -389,6 +389,7 @@ class LazySupervisedDataset(Dataset):
         do_seg = False,
         inference = False,
         sam_size = 1024,
+        data_length = 0,
     ):
         super(LazySupervisedDataset, self).__init__()
         self.ds_name = ds_name
@@ -445,6 +446,8 @@ class LazySupervisedDataset(Dataset):
                 assert isinstance(repeat_time, int)
                 # Repeat the list if repeat_time is greater than 1
                 self.raw_data = self.raw_data * repeat_time
+            if data_length != 0:
+                self.raw_data = self.raw_data[:data_length]
 
         self.rng = np.random.default_rng(seed=random_seed)
         if self.force_shuffle: #False
@@ -942,6 +945,7 @@ def build_datasets(
     ds_collections = json.loads(open(data_args.meta_path).read())
     for ds_idx, ds_name in enumerate(ds_collections.keys()):
         repeat_time = ds_collections[ds_name]['repeat_time']
+        data_length = ds_collections[ds_name]['length']
         if 'max_dynamic_patch' in ds_collections[ds_name]:
             max_num = ds_collections[ds_name]['max_dynamic_patch']
             logger.info(f'max_dynamic_patch is set to {max_num} according to the meta file')
@@ -975,6 +979,7 @@ def build_datasets(
             do_seg = data_args.do_seg,
             inference= data_args.inference,
             sam_size = data_args.sam_size,
+            data_length = data_length,
         )
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
         datasets.append(dataset)

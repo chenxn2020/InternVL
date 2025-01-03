@@ -435,7 +435,7 @@ class InternVLChatModel(PreTrainedModel):
             use_cache=True,
             **generate_kwargs,
         )
-
+        
         return outputs
 
     @property

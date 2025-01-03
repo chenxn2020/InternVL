@@ -16,6 +16,7 @@ from .pad_data_collator import (
     concat_seg_data_collator,
     dpo_concat_pad_data_collator,
     pad_data_collator,
+    concat_mag_data_collator,
 )
 from .phi3_packed_training_patch import replace_phi3_attention_class
 from .qwen2_packed_training_patch import replace_qwen2_attention_class

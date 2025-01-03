@@ -1,0 +1,9 @@
+{
+  "color_block_content_qa": {
+    "root": "/",
+    "annotation": "/cpfs01/user/caixinyu/markdownGenerate/test_bbox/color_block_content_qa.jsonl",
+    "data_augment": false,
+    "repeat_time": 1,
+    "length": 83000
+  }
+}

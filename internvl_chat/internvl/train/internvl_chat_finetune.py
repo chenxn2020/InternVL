@@ -1,4 +1,4 @@
-# --------------------------------------------------------
+    # --------------------------------------------------------
 # InternVL
 # Copyright (c) 2024 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
@@ -17,86 +17,49 @@ from functools import partial
 from typing import Dict, Literal, Optional
 
 import numpy as np
-import torch.nn.functional as F
 
 try:
     import orjson as json
 except:
     import json
 
-import ast
-
-import cv2
 import torch
 import torch.distributed as dist
 import transformers
-from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
-from torch.utils.data import Dataset
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    HfArgumentParser,
-    Trainer,
-    TrainingArguments,
-    set_seed,
-)
-from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils.logging import (
-    enable_default_handler,
-    enable_explicit_format,
-    set_verbosity,
-)
-
 from internvl.dist_utils import init_dist
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
-from internvl.model.internvl_chat import (
-    InternVisionConfig,
-    InternVisionModel,
-    InternVLChatConfig,
-    InternVLChatModel,
-)
-from internvl.patch import (
-    concat_pad_data_collator,
-    concat_seg_data_collator,
-    get_mask_from_data,
-    replace_internlm2_attention_class,
-    replace_llama_attention_class,
-    replace_llama_rmsnorm_with_fused_rmsnorm,
-    replace_phi3_attention_class,
-    replace_qwen2_attention_class,
-    replace_train_dataloader,
-    replace_train_sampler,
-)
-
-from internvl.model.segment_anything import ResizeLongestSide
-from internvl.train.constants import (
-    BOX_END_TOKEN,
-    BOX_START_TOKEN,
-    IMG_CONTEXT_TOKEN,
-    IMG_END_TOKEN,
-    IMG_START_TOKEN,
-    QUAD_END_TOKEN,
-    QUAD_START_TOKEN,
-    REF_END_TOKEN,
-    REF_START_TOKEN,
-    SEG_TOKEN,
-)
-from internvl.train.dataset import (
-    ConcatDataset,
-    TCSLoader,
-    WeightedConcatDataset,
-    build_transform,
-    check_conversations_repetition,
-    dynamic_preprocess,
-    preprocess,
-    preprocess_internlm,
-    preprocess_internvl2_5,
-    preprocess_internvl2_5_seg,
-    preprocess_mpt,
-    preprocess_phi3,
-)
+from internvl.model.internvl_chat import (InternVisionConfig,
+                                          InternVisionModel,
+                                          InternVLChatConfig,
+                                          InternVLChatModel)
+from internvl.patch import (concat_pad_data_collator,
+                            replace_internlm2_attention_class,
+                            replace_llama_attention_class,
+                            replace_llama_rmsnorm_with_fused_rmsnorm,
+                            replace_phi3_attention_class,
+                            replace_qwen2_attention_class,
+                            replace_train_dataloader, replace_train_sampler)
+from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
+                                      IMG_CONTEXT_TOKEN, IMG_END_TOKEN,
+                                      IMG_START_TOKEN, QUAD_END_TOKEN,
+                                      QUAD_START_TOKEN, REF_END_TOKEN,
+                                      REF_START_TOKEN)
+from internvl.train.dataset import (ConcatDataset, TCSLoader,
+                                    WeightedConcatDataset, build_transform,
+                                    check_conversations_repetition,
+                                    dynamic_preprocess, preprocess,
+                                    preprocess_internlm,
+                                    preprocess_internvl2_5, preprocess_mpt,
+                                    preprocess_phi3)
 from internvl.train.dataset_packed import PackedDataset, packed_collate_fn
+from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
+from torch.utils.data import Dataset
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
+                          HfArgumentParser, Trainer, TrainingArguments,
+                          set_seed)
+from transformers.trainer_utils import get_last_checkpoint
+from transformers.utils.logging import (enable_default_handler,
+                                        enable_explicit_format, set_verbosity)
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
 try:
@@ -223,7 +186,7 @@ class DataTrainingArguments:
         metadata={'help': 'Pad the image to a square shape if set to True. Default is False.'},
     )
     conv_style: str = field(
-        default='internvl2_5', metadata={'help': 'Prompt style for a conversation.'}
+        default='internlm2-chat', metadata={'help': 'Prompt style for a conversation.'}
     )
     meta_path: str = field(
         default=None,
@@ -301,14 +264,6 @@ class DataTrainingArguments:
         default=False,
         metadata={'help': 'Whether to gather all during loss reduction. Default is False.'},
     )
-    do_seg: bool = field(
-        default=False,
-        metadata={'help': 'Whether to train internvl to segmentation.'},
-    )
-    sam_size: int = field(
-        default=1024,
-        metadata={'help': 'Image size of segmentation model.'},
-    )
 
 
 class LazySupervisedDataset(Dataset):
@@ -342,8 +297,7 @@ class LazySupervisedDataset(Dataset):
         distributed_mode=False,
         force_shuffle=False,
         random_seed=0,
-        do_seg = False,
-        sam_size = 1024,
+        data_length=0,
     ):
         super(LazySupervisedDataset, self).__init__()
         self.ds_name = ds_name
@@ -361,16 +315,6 @@ class LazySupervisedDataset(Dataset):
         self.max_num_frame = max_num_frame
         self.min_num_frame = min_num_frame
         self.sampling_method = sampling_method
-
-        #--判断是否做seg
-        self.do_seg = do_seg
-        if self.do_seg: #配置一些sam的参数
-            self.sam_size = sam_size
-            self.transform_sam = ResizeLongestSide(sam_size) #Image size of segmentation model
-            self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
-            self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
-            self.ignore_label = 255
-        #--判断是否做seg
 
         # hyperparameters for distributed training
         self.use_packed_ds = use_packed_ds
@@ -390,6 +334,7 @@ class LazySupervisedDataset(Dataset):
 
         logger.info('Formatting inputs...Skip in lazy mode')
         assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
+
         with open(meta['annotation'], 'r') as f:
             self.raw_data = f.readlines()
             if repeat_time < 1:
@@ -399,9 +344,11 @@ class LazySupervisedDataset(Dataset):
                 assert isinstance(repeat_time, int)
                 # Repeat the list if repeat_time is greater than 1
                 self.raw_data = self.raw_data * repeat_time
+            if data_length != 0:
+                self.raw_data = self.raw_data[:data_length]
 
         self.rng = np.random.default_rng(seed=random_seed)
-        if self.force_shuffle: #False
+        if self.force_shuffle:
             self.rng.shuffle(self.raw_data)
 
         self.root = meta['root']
@@ -421,16 +368,10 @@ class LazySupervisedDataset(Dataset):
             self.length = []
             for data_item in self.raw_data:
                 data_item = json.loads(data_item)
-                #--将原始VQA答案构造成SEG答案
-                #TODO：后续在数据提前构建好 就不用了
-                if self.do_seg:
-                    data_item = self.preprocess_seg_answer(data_item)
-                #---
                 if 'length' in data_item:
                     token_length = data_item['length']  # Use precomputed length if available
                 else:
                     # Compute token length using the tokenizer
-                    # 默认走这里，计算每条样本的token长度
                     conversations = '\n'.join([temp['value'] for temp in data_item['conversations']])
                     str_length = len(conversations)
                     if str_length not in self.conv2length:
@@ -456,8 +397,6 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_phi3
         elif self.template_name == 'internvl2_5':
             preprocess_function = preprocess_internvl2_5
-        elif self.template_name == 'internvl2_5_seg':
-            preprocess_function = preprocess_internvl2_5_seg
         else:
             preprocess_function = preprocess
         return preprocess_function
@@ -484,6 +423,7 @@ class LazySupervisedDataset(Dataset):
     def multi_modal_get_item(self, data_item):
         # Build transformation function
         transform = self.get_transform()
+
         # Ensure the first conversation contains an image placeholder
         if '<image>' not in data_item['conversations'][0]['value']:
             data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
@@ -534,111 +474,7 @@ class LazySupervisedDataset(Dataset):
             image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
         )
         return ret
-    def preprocess_seg_answer(self, data_item):
-        #--后续还是在数据构建的时候，就构建seg的对话形式比较好
-        # bbox 列表
-        bbox = data_item['bbox']  
-        bbox = ast.literal_eval(bbox)
-        data_item['bbox'] = bbox
-        # 根据列表长度生成 [SEG] 内容
-        seg_list = [SEG_TOKEN] * len(bbox)
-        # 格式化输出
-        if len(seg_list) == 1:
-            result = f"Based on the question, the queried region is {seg_list[0]}."
-        elif len(seg_list) == 2:
-            result = f"Based on the question, the queried regions are {seg_list[0]} and {seg_list[1]}."
-        else:
-            result = f"Based on the question, the queried regions are {', '.join(seg_list[:-1])}, and {seg_list[-1]}."
-        data_item['conversations'][1]['value'] = result
-        return data_item
-    def sam_preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize pixel values and pad to a square input."""
-        # Normalize colors
-        
-        x = (x - self.pixel_mean) / self.pixel_std
 
-        # Pad
-        h, w = x.shape[-2:]
-        padh = self.sam_size - h
-        padw = self.sam_size - w
-        x = F.pad(x, (0, padw, 0, padh))
-        return x
-    def multi_modal_get_seg_item(self, data_item):
-        # Build transformation function
-        transform = self.get_transform()
-        #--将原始VQA答案构造成SEG答案
-        #TODO：后续在数据提前构建好 就不用了
-        data_item = self.preprocess_seg_answer(data_item)
-        #----
-        # Ensure the first conversation contains an image placeholder
-        if '<image>' not in data_item['conversations'][0]['value']:
-            data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
-
-        # Merge the image path
-        image_path = self.get_image_path(data_item['image'])
-        # Load the image using tcs_loader if available, otherwise use PIL
-        image = self.load_image(image_path)
-        orig_size = image.size
-
-        if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
-            images = dynamic_preprocess(image, min_num=self.min_dynamic_patch, max_num=self.max_dynamic_patch,
-                                        image_size=self.image_size, use_thumbnail=self.use_thumbnail)
-        else:  # Otherwise, use the original image as a single patch
-            images = [image]
-
-        # Apply the transformation to each image and stack the results into a tensor
-        pixel_values = [transform(image) for image in images]
-        pixel_values = torch.stack(pixel_values)
-
-        # Ensure that there is only one patch if dynamic image size is not enabled
-        num_patches = pixel_values.size(0)
-        if not self.dynamic_image_size:
-            assert num_patches == 1, f'The number of patches should be 1, but got {num_patches}.'
-
-        # Select the appropriate preprocessing function based on the template name
-        preprocess_function = self.get_preprocess_function()
-        # Preprocess the conversations and generate the return dictionary
-        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, [self.num_image_token * num_patches],
-                                  group_by_length=self.group_by_length,
-                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name)
-
-        # Calculate position_ids for packed dataset
-        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
-        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
-        image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
-        assert (ret['input_ids'][0] == image_end_token_id).sum() == 1, f'image tokens are truncated, this dataset is {self.ds_name}'
-        #---- 给SAM 制造输入----------------------------
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image_sam = self.transform_sam.apply_image(image)
-        resize_sam = image_sam.shape[:2]
-        image_sam = self.sam_preprocess(torch.from_numpy(image_sam).permute(2, 0, 1).contiguous())
-        conversations = [data_item['conversations']]
-        masks = get_mask_from_data(data_item, image)
-        masks = torch.from_numpy(masks).unsqueeze(0)
-        label_sam = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
-        # Create the final return dictionary
-        print('****************************SEG DATASET***************************************')
-        ret = dict(
-            #--VLM 训练使用
-            input_ids=ret['input_ids'][0],
-            labels=ret['labels'][0],
-            attention_mask=ret['attention_mask'][0],
-            position_ids=position_ids[0],
-            pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
-            #--SAM 分割使用
-            image_sam = image_sam, 
-            conversations = conversations,
-            resize = resize_sam,
-            do_seg = self.do_seg,
-            masks = masks,
-            label_sam = label_sam,
-        )
-        return ret
-    def multi_modal_multi_image_get_seg_item(self, data_item):
-        pass
     def multi_modal_multi_image_get_item(self, data_item):
         # Build transformation function
         transform = self.get_transform()
@@ -810,24 +646,14 @@ class LazySupervisedDataset(Dataset):
             if try_cnt > max_try:
                 raise StopIteration
             try:
-                #--读取jsonl里的单条内容， self.raw_data是jsonl文件里的内容   
                 data_item = json.loads(self.raw_data[i])
                 # conversations = data_item['conversations']
                 # check_conversations_repetition(conversations, repeat_threshold=0.4, ngram=10)
                 if 'image' in data_item and len(data_item['image']) != 0:
                     if type(data_item['image']) == list:
-                        #--多张图片处理通道
-                        if self.do_seg:
-                            ret = self.multi_modal_multi_image_get_seg_item(data_item)
-                        else:
-                            ret = self.multi_modal_multi_image_get_item(data_item)
+                        ret = self.multi_modal_multi_image_get_item(data_item)
                     else:
-                        #--单张图片处理通道
-                        if self.do_seg:
-                            ret = self.multi_modal_get_seg_item(data_item)
-                        else:
-                            #--raw
-                            ret = self.multi_modal_get_item(data_item)
+                        ret = self.multi_modal_get_item(data_item)
                 elif 'video' in data_item and data_item['video'] is not None and data_item['video'] != '':
                     ret = self.video_get_item(data_item)
                 else:
@@ -896,6 +722,7 @@ def build_datasets(
     ds_collections = json.loads(open(data_args.meta_path).read())
     for ds_idx, ds_name in enumerate(ds_collections.keys()):
         repeat_time = ds_collections[ds_name]['repeat_time']
+        data_length = ds_collections[ds_name]['length']
         if 'max_dynamic_patch' in ds_collections[ds_name]:
             max_num = ds_collections[ds_name]['max_dynamic_patch']
             logger.info(f'max_dynamic_patch is set to {max_num} according to the meta file')
@@ -926,8 +753,7 @@ def build_datasets(
             distributed_mode=data_args.use_packed_ds,
             force_shuffle=data_args.use_packed_ds,
             random_seed=ds_idx,
-            do_seg = data_args.do_seg,
-            sam_size = data_args.sam_size,
+            data_length = data_length,
         )
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
         datasets.append(dataset)
@@ -958,7 +784,6 @@ def build_datasets(
         weights = [l / total_length for l in lengths]
         train_dataset = WeightedConcatDataset(datasets, weights)
     else:
-        #默认使用这个
         train_dataset = ConcatDataset(datasets)
     return train_dataset
 
@@ -1050,12 +875,11 @@ def main():
     tokenizer.model_max_length = data_args.max_seq_length
     token_list = [IMG_START_TOKEN, IMG_END_TOKEN, IMG_CONTEXT_TOKEN,
                   QUAD_START_TOKEN, QUAD_END_TOKEN, REF_START_TOKEN,
-                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, SEG_TOKEN]
+                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN]
     num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
-    tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None # 默认为None
+    tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
 
-    #---skip
     if data_args.use_packed_ds:
         replace_internlm2_attention_class()
         replace_qwen2_attention_class()
@@ -1063,19 +887,13 @@ def main():
         replace_llama_attention_class()
 
     if model_args.use_liger:
-        from liger_kernel.transformers import (
-            apply_liger_kernel_to_llama,
-            apply_liger_kernel_to_qwen2,
-        )
-
         from internvl.patch import apply_liger_kernel_to_internvit
+        from liger_kernel.transformers import (apply_liger_kernel_to_llama,
+                                               apply_liger_kernel_to_qwen2)
         apply_liger_kernel_to_llama()
         apply_liger_kernel_to_qwen2()
         # apply_liger_kernel_to_internvit()
-    #---skip-----------
 
-    #Initialize the model
-    #TODO: 仿照GSVA写一个外部模型接口
     if model_args.model_name_or_path is not None:
         logger.info('Loading InternVLChatModel...')
         config = InternVLChatConfig.from_pretrained(model_args.model_name_or_path)
@@ -1171,18 +989,7 @@ def main():
         min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch,
         normalize_type=data_args.normalize_type, min_num_frame=data_args.min_num_frame,
         max_num_frame=data_args.max_num_frame)
-    
-    #TODO:code dataset
-    # a = train_dataset[0]
-    # from torch.utils.data import DataLoader
-    # print('Debug collator**************************')
-    # dataloader = DataLoader(train_dataset
-    #                         , batch_size=2, shuffle=True, 
-    #                         collate_fn=concat_pad_data_collator)
-    #--直接包装是没问题的
-    # for batch in dataloader:
-    #     from IPython import embed; embed(); exit()
-    #--------
+
     def _freeze_params(module):
         for param in module.parameters():
             param.requires_grad = False
@@ -1216,6 +1023,7 @@ def main():
             v.requires_grad = True
 
     # print trainable parameters
+    logger.info('Trainable parameters:')
     if dist.get_rank() == 0:
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -1234,10 +1042,7 @@ def main():
             loss_reduction_all_gather=data_args.loss_reduction_all_gather,
         )
     else:
-        if data_args.do_seg:
-            collator = concat_seg_data_collator
-        else:
-            collator = concat_pad_data_collator
+        collator = concat_pad_data_collator
 
     trainer = Trainer(
         model=model,

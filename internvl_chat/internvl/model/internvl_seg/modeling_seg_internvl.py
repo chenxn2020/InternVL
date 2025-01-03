@@ -42,6 +42,7 @@ class SAMMetaModel(nn.Module):
     def init_seg_and_proj(self, config):
         #类初始化的时候不运行这段代码！！！,在main中单独运行
         # SAM
+        print("Loading SAM")
         builder_sam = build_sam_vit_h if "sam_vit_h" in self.segmentation_model_path else \
             build_sam_vit_l if "sam_vit_l" in self.segmentation_model_path else build_sam_vit_b
         self.visual_model = builder_sam(self.segmentation_model_path)
@@ -96,7 +97,6 @@ class SegInternVLForCausalLM(InternVLChatModel):
         self.model = SamModel(config, seg_token_idx=self.seg_token_idx, **kwargs)
         # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         #TODO：得看下internvl里的patches个数
-        self.Np = 225
         self.post_init()
     
     def get_model(self):
@@ -148,32 +148,31 @@ class SegInternVLForCausalLM(InternVLChatModel):
         image_embeddings = self.get_visual_embs(images)
         batch_size = image_embeddings.shape[0]
         assert batch_size == len(offset) - 1
-        if inference:
-            pass
-        else:
-            images_clip_list = []
-            #---如果是多轮对话就需要对图片进行expand
-            # for i in range(len(offset) - 1): # offset marks each begin and end index for each images.
-            #     start_i, end_i = offset[i], offset[i + 1]
-            #     images_clip_i = (pixel_values[i].unsqueeze(0).expand(end_i - start_i, -1, -1, -1).contiguous())
-            #     images_clip_list.append(images_clip_i)
-            # images_clip = torch.cat(images_clip_list, dim=0)
-            images_clip = pixel_values
-            #-----
-            # VLM inference, obtain InternVL output
-            output = super().forward(
-                pixel_values=images_clip,
-                attention_mask=attention_mask,
-                input_ids=input_ids, #input_ids 就是整个prompt模版下的问答
-                labels=labels,
-                image_flags=image_flags,
-                position_ids=position_ids,
-                output_hidden_states=True
-            )
-            output_hidden_states = output.hidden_states #所有层的embeddings,tuple形式
+        
+        # # ---如果是多轮对话就需要对图片进行expand
+        # images_clip_list = []
+        # for i in range(len(offset) - 1): # offset marks each begin and end index for each images.
+        #     start_i, end_i = offset[i], offset[i + 1]
+        #     images_clip_i = (pixel_values[i].unsqueeze(0).expand(end_i - start_i, -1, -1, -1).contiguous())
+        #     images_clip_list.append(images_clip_i)
+        # images_clip = torch.cat(images_clip_list, dim=0)
+        #----
+
+        #-----
+        # VLM inference, obtain InternVL output
+        images_clip = pixel_values
+        output = super().forward(
+            pixel_values=images_clip,
+            attention_mask=attention_mask,
+            input_ids=input_ids, #input_ids 就是整个prompt模版下的问答
+            labels=labels,
+            image_flags=image_flags,
+            position_ids=position_ids,
+            output_hidden_states=True
+        )
+        output_hidden_states = output.hidden_states #所有层的embeddings,tuple形式
         hidden_states = []
         assert len(self.model.text_hidden_fcs) == 1
-        # from IPython import embed; embed(); exit()
         hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
 
@@ -194,6 +193,7 @@ class SegInternVLForCausalLM(InternVLChatModel):
         #---
         pred_masks = []
         pred_ious = []
+        src_images = []
         mask_img_map = [(t >= offset).long().argmin().item() - 1 for t in range(num_pred_embs)]
         for i in range(len(pred_embeddings)):
             (
@@ -206,8 +206,7 @@ class SegInternVLForCausalLM(InternVLChatModel):
                 text_embeds=pred_embeddings[i].unsqueeze(1),
             )
             sparse_embeddings = sparse_embeddings.to(dtype)
-            #TODO:SAM只能输出低分辨率mask？？？
-            low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+            low_res_masks, iou_predictions, src_image = self.model.visual_model.mask_decoder(
                 image_embeddings=image_embeddings[mask_img_map[i]].unsqueeze(0),
                 image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings,
@@ -221,6 +220,8 @@ class SegInternVLForCausalLM(InternVLChatModel):
             )
             pred_masks.append(pred_mask[:, 0])
             pred_ious.append(iou_predictions[:, 0])
+            src_images.append(src_image)
+        # src_images = torch.cat(src_images, dim=0)
         
         model_output = output
         gt_masks = masks_list
@@ -228,13 +229,13 @@ class SegInternVLForCausalLM(InternVLChatModel):
         for b in range(batch_size):
             for pm, gm in zip(pred_masks[b], gt_masks[b]):
                 assert pm.shape == gm.shape, f"b_idx: {b}, pm.shape: {pm.shape}, gm.shape: {gm.shape}"
+        #--如果inference
         if inference:
-            pass
-            # return {
-            #     "pred_masks": pred_masks,
-            #     "gt_masks": gt_masks,
-            #     "output_ids": output_ids
-            # }
+            return {
+                "pred_masks": pred_masks,
+                "gt_masks": gt_masks,
+            }
+        from IPython import embed; embed(); exit()
         ce_loss = model_output.loss
         ce_loss = ce_loss * self.ce_loss_weight
         loss = 0
@@ -275,8 +276,98 @@ class SegInternVLForCausalLM(InternVLChatModel):
             "ce_loss": ce_loss,
             "mask_bce_loss": mask_bce_loss,
             "mask_dice_loss": mask_dice_loss,
-            "mask_loss": mask_loss
+            "mask_loss": mask_loss,
         }
+    @torch.no_grad()
+    def generate(self,
+        #---InterChatModel input
+        pixel_values: torch.FloatTensor,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        image_flags: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        statistics: Optional[torch.LongTensor] = None,
+        loss_weight: Optional[List] = None,
+        loss_reduction_all_gather: Optional[bool] = False,
+        #---SAM input
+        images: torch.FloatTensor = None,
+        offset: torch.LongTensor = None,
+        **kwargs,
+    ):
+        device, dtype = images.device, images.dtype
+        image_embeddings = self.get_visual_embs(images)
+        batch_size = image_embeddings.shape[0]
+        assert batch_size == len(offset) - 1
+        
+        #---如果是多轮对话就需要对图片进行expand
+        # images_clip_list = []
+        # for i in range(len(offset) - 1): # offset marks each begin and end index for each images.
+        #     start_i, end_i = offset[i], offset[i + 1]
+        #     images_clip_i = (pixel_values[i].unsqueeze(0).expand(end_i - start_i, -1, -1, -1).contiguous())
+        #     images_clip_list.append(images_clip_i)
+        # images_clip = torch.cat(images_clip_list, dim=0)
+        images_clip = pixel_values
+        #-----
+        # VLM inference, obtain InternVL output
+        output = super().forward(
+            pixel_values=images_clip,
+            attention_mask=attention_mask,
+            input_ids=input_ids, #input_ids 就是整个prompt模版下的问答
+            labels=labels,
+            image_flags=image_flags,
+            position_ids=position_ids,
+            output_hidden_states=True
+        )
+        output_hidden_states = output.hidden_states #所有层的embeddings,tuple形式
+        hidden_states = []
+        assert len(self.model.text_hidden_fcs) == 1
+        hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
+        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+
+        seg_token_mask = input_ids == self.seg_token_idx     
+        #--这部分代码是说如果一个样本有多个SEG token会导致pred SEG不知道是哪条数据的预测SEG,所以要将pre_emb分组到各自的样本里 
+        pred_embeddings = last_hidden_state[seg_token_mask] #shape[SEG_num, hidden_dim]
+        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+        seg_token_offset = seg_token_counts.cumsum(-1) #累积和
+        seg_token_offset = torch.cat(
+            [torch.tensor([0], dtype=torch.int64, device=device), seg_token_offset], dim=0
+        )     
+        pred_embeddings_ = []
+        num_pred_embs = len(seg_token_offset) - 1 #bs
+        for i in range(num_pred_embs):
+            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+            pred_embeddings_.append(pred_embeddings[start_i:end_i])
+        pred_embeddings = pred_embeddings_ #以列表形式分组保存每条数据的预测SEG
+        #---
+        src_images = []
+        mask_img_map = [(t >= offset).long().argmin().item() - 1 for t in range(num_pred_embs)]
+        for i in range(len(pred_embeddings)):
+            (
+                sparse_embeddings,
+                dense_embeddings,
+            ) = self.model.visual_model.prompt_encoder(
+                points=None,
+                boxes=None,
+                masks=None,
+                text_embeds=pred_embeddings[i].unsqueeze(1),
+            )
+            sparse_embeddings = sparse_embeddings.to(dtype)
+            low_res_masks, iou_predictions, src_image = self.model.visual_model.mask_decoder(
+                image_embeddings=image_embeddings[mask_img_map[i]].unsqueeze(0),
+                image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False
+            )
+            src_images.append(src_image)
+        src_images = torch.cat(src_images, dim=0)
+        return src_images
 
 class Test(InternVLChatModel):
     def __init__(self, config, **kwargs):

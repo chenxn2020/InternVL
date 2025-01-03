@@ -1,3 +1,4 @@
+#!/bin/bash
 set -x
 
 CHECKPOINT=${1}
@@ -6,10 +7,11 @@ CHECKPOINT="$(pwd)/${CHECKPOINT}"
 export PYTHONPATH="$(pwd):${PYTHONPATH}"
 echo "CHECKPOINT: ${CHECKPOINT}"
 
-MASTER_PORT=${MASTER_PORT:-63669}
-PORT=${PORT:-63665}
-GPUS=${GPUS:-8}
-GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+MASTER_PORT=${MASTER_PORT:-42669}
+
+PORT=${PORT:-71165}
+GPUS=${GPUS:-1}
+GPUS_PER_NODE=${GPUS_PER_NODE:-1}
 NODES=$((GPUS / GPUS_PER_NODE))
 export MASTER_PORT=${MASTER_PORT}
 export PORT=${PORT}
@@ -704,3 +706,24 @@ if [ ${DATASET} == "rsvqa-hr-test2" ]; then
       --master_port=${MASTER_PORT} \
       eval/domain_specific/rs_vqa/evaluate.py --checkpoint ${CHECKPOINT} --datasets RSVQA_L "${ARGS[@]:2}"
 fi
+
+if [ ${DATASET} == "seg" ]; then
+    CUDA_VISIBLE_DEVICES=7 torchrun \
+      --nnodes=1 \
+      --node_rank=0 \
+      --master_addr=127.0.0.1 \
+      --nproc_per_node=${GPUS} \
+      --master_port=${MASTER_PORT} \
+      eval/internvl_seg/evaluate_seg.py --checkpoint ${CHECKPOINT} --dataset color_block "${ARGS[@]:2}"
+fi
+
+if [ ${DATASET} == "mag" ]; then
+    CUDA_VISIBLE_DEVICES=6 torchrun \
+      --nnodes=1 \
+      --node_rank=0 \
+      --master_addr=127.0.0.1 \
+      --nproc_per_node=${GPUS} \
+      --master_port=${MASTER_PORT} \
+      eval/internvl_seg/evaluate_mag.py --checkpoint ${CHECKPOINT} --dataset color_block "${ARGS[@]:2}"
+fi
+
